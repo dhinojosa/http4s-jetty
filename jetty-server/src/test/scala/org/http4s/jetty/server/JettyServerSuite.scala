@@ -35,94 +35,96 @@ import scala.concurrent.duration._
 
 class JettyServerSuite extends CatsEffectSuite {
 
-  private def builder = JettyBuilder[IO]
+    private def builder = JettyBuilder[IO]
 
-  private val client =
-    ResourceSuiteLocalFixture(
-      "jetty-client",
-      Resource.make(IO(new HttpClient()))(c => IO(c.stop())).evalTap(c => IO(c.start())),
-    )
+    private val client =
+        ResourceSuiteLocalFixture(
+            "jetty-client",
+            Resource.make(IO(new HttpClient()))(c => IO(c.stop())).evalTap(c => IO(c.start())),
+        )
 
-  override def munitFixtures: List[Fixture[HttpClient]] = List(client)
+    override def munitFixtures: List[Fixture[HttpClient]] = List(client)
 
-  private val serverR =
-    builder
-      .bindAny()
-      .withAsyncTimeout(3.seconds)
-      .mountService(
-        HttpRoutes.of {
-          case GET -> Root / "thread" / "routing" =>
-            val thread = Thread.currentThread.getName
-            Ok(thread)
+    private val serverR =
+        builder
+            .bindAny()
+            .withAsyncTimeout(3.seconds)
+            .mountService(
+                HttpRoutes.of {
+                    case GET -> Root / "thread" / "routing" =>
+                        val thread = Thread.currentThread.getName
+                        Ok(thread)
 
-          case GET -> Root / "thread" / "effect" =>
-            IO(Thread.currentThread.getName).flatMap(Ok(_))
+                    case GET -> Root / "thread" / "effect" =>
+                        IO(Thread.currentThread.getName).flatMap(Ok(_))
 
-          case req @ POST -> Root / "echo" =>
-            Ok(req.body)
+                    case req@POST -> Root / "echo" =>
+                        Ok(req.body)
 
-          case GET -> Root / "never" =>
-            IO.never
+                    case GET -> Root / "never" =>
+                        IO.never
 
-          case GET -> Root / "slow" =>
-            Temporal[IO].sleep(50.millis) *> Ok("slow")
-        },
-        "/",
-      )
-      .resource
+                    case GET -> Root / "slow" =>
+                        Temporal[IO].sleep(50.millis) *> Ok("slow")
+                },
+                "/",
+            )
+            .resource
 
-  private val jettyServer = ResourceFixture[Server](serverR)
+    private val jettyServer = ResourceFixture[Server](serverR)
 
-  private def fetchBody(req: Request): IO[String] =
-    IO.async { cb =>
-      IO {
-        val listener = new BufferingResponseListener() {
-          override def onFailure(resp: Response, t: Throwable) =
-            cb(Left(t))
+    private def fetchBody(req: Request): IO[String] =
+        IO.async { cb =>
+            IO {
+                val listener = new BufferingResponseListener() {
+                    override def onFailure(resp: Response, t: Throwable) =
+                        cb(Left(t))
 
-          override def onComplete(result: Result) =
-            cb(Right(getContentAsString))
+                    override def onComplete(result: Result) =
+                        cb(Right(getContentAsString))
+                }
+                req.send(listener)
+            }.as(Some(IO.unit))
         }
-        req.send(listener)
-      }.as(Some(IO.unit))
+
+    private def get(server: Server, path: String): IO[String] = {
+        val req = client().newRequest(s"http://127.0.0.1:${server.address.getPort}$path")
+        fetchBody(req)
     }
 
-  private def get(server: Server, path: String): IO[String] = {
-    val req = client().newRequest(s"http://127.0.0.1:${server.address.getPort}$path")
-    fetchBody(req)
-  }
+    private def post(server: Server, path: String, body: String): IO[String] = {
+        val req = client()
+            .newRequest(s"http://127.0.0.1:${server.address.getPort}$path")
+            .method("POST")
+            .content(new StringContentProvider(body))
+        fetchBody(req)
+    }
 
-  private def post(server: Server, path: String, body: String): IO[String] = {
-    val req = client()
-      .newRequest(s"http://127.0.0.1:${server.address.getPort}$path")
-      .method("POST")
-      .content(new StringContentProvider(body))
-    fetchBody(req)
-  }
+    jettyServer.test("ChannelOptions should route requests on the service executor") { server =>
+        get(server, "/thread/routing").map(_.startsWith("io-compute-")).assert
+    }
 
-  jettyServer.test("ChannelOptions should route requests on the service executor") { server =>
-    get(server, "/thread/routing").map(_.startsWith("io-compute-")).assert
-  }
+    jettyServer.test("ChannelOptions should execute the service task on the service executor") {
+        server =>
+            get(server, "/thread/effect").map(_.startsWith("io-compute-")).assert
+    }
 
-  jettyServer.test("ChannelOptions should execute the service task on the service executor") {
-    server =>
-      get(server, "/thread/effect").map(_.startsWith("io-compute-")).assert
-  }
+    jettyServer.test("ChannelOptions should be able to echo its input") { server =>
+        val input = """{ "Hello": "world" }"""
+        post(server, "/echo", input).map(_.startsWith(input)).assert
+    }
 
-  jettyServer.test("ChannelOptions should be able to echo its input") { server =>
-    val input = """{ "Hello": "world" }"""
-    post(server, "/echo", input).map(_.startsWith(input)).assert
-  }
+    jettyServer.test("Timeout should not fire prematurely") { server =>
+        get(server, "/slow").assertEquals("slow")
+    }
 
-  jettyServer.test("Timeout should not fire prematurely") { server =>
-    get(server, "/slow").assertEquals("slow")
-  }
+    jettyServer.test("Timeout should fire on timeout") { server =>
+        get(server, "/never").map {
+            _.contains("Error 500 AsyncContext timeout")
+        }
+    }
 
-  jettyServer.test("Timeout should fire on timeout") { server =>
-    get(server, "/never").map{_.contains("Error 500 AsyncContext timeout")}
-  }
-
-  jettyServer.test("Timeout should execute the service task on the service executor") { server =>
-    get(server, "/thread/effect").map(_.startsWith("io-compute-")).assert
-  }
+    jettyServer.test("Timeout should execute the service task on the service executor") { server =>
+        get(server, "/thread/effect").map(_.startsWith("io-compute-")).assert
+    }
 }
