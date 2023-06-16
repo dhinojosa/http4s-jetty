@@ -29,6 +29,7 @@ val http4sServletVersion = "0.23.14"
 val munitCatsEffectVersion = "1.0.7"
 val slf4jVersion = "1.7.25"
 
+//Comment
 lazy val jettyServer = project
   .in(file("jetty-server"))
   .settings(
